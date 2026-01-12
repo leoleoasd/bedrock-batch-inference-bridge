@@ -12,13 +12,13 @@ A Python SDK that provides a boto3-compatible `invoke_model` API while transpare
 ## Installation
 
 ```bash
-pip install batch-inference
+pip install git+ssh://git@github.com/leoleoasd/bedrock-batch-inference-bridge.git
 ```
 
 Or with uv:
 
 ```bash
-uv add batch-inference
+uv add git+ssh://git@github.com/leoleoasd/bedrock-batch-inference-bridge.git
 ```
 
 ## Quick Start
