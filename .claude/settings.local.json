@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tree:*)",
+      "WebFetch(domain:boto3.amazonaws.com)",
+      "Bash(python3 -m py_compile:*)",
+      "Bash(python test_batch_inference.py:*)",
+      "Bash(uv run:*)",
+      "Bash(cat:*)"
+    ]
+  }
+}
