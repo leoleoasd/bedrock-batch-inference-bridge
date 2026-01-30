@@ -81,3 +81,4 @@ class BatchConfig:
     job_timeout_hours: int = 24
     job_name_prefix: str = "batch-inference"
     bedrock_min_records: int = 100  # Bedrock's hard minimum, pad with dummy if needed
+    debug_mode: bool = False  # If True, use direct invoke_model instead of batch
