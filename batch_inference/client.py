@@ -324,13 +324,19 @@ class BatchInferenceClient:
                 content = msg.get("content", "")
                 if isinstance(content, str):
                     openai_msg["content"] = content
+                    openai_messages.append(openai_msg)
                 elif isinstance(content, list):
                     # Convert content blocks to OpenAI format
                     parts = []
+                    tool_calls = []
+                    tool_results = []
+                    
                     for block in content:
-                        if block.get("type") == "text":
+                        block_type = block.get("type")
+                        
+                        if block_type == "text":
                             parts.append({"type": "text", "text": block.get("text", "")})
-                        elif block.get("type") == "image":
+                        elif block_type == "image":
                             # Handle image blocks
                             source = block.get("source", {})
                             if source.get("type") == "base64":
@@ -340,13 +346,57 @@ class BatchInferenceClient:
                                         "url": f"data:{source.get('media_type', 'image/png')};base64,{source.get('data', '')}"
                                     }
                                 })
-                    # If only text parts, simplify to string
-                    if len(parts) == 1 and parts[0].get("type") == "text":
-                        openai_msg["content"] = parts[0]["text"]
+                        elif block_type == "tool_use":
+                            # Bedrock tool_use -> OpenAI tool_calls
+                            tool_calls.append({
+                                "id": block.get("id", ""),
+                                "type": "function",
+                                "function": {
+                                    "name": block.get("name", ""),
+                                    "arguments": json.dumps(block.get("input", {})),
+                                }
+                            })
+                        elif block_type == "tool_result":
+                            # Bedrock tool_result -> OpenAI tool message
+                            tool_results.append({
+                                "tool_use_id": block.get("tool_use_id", ""),
+                                "content": block.get("content", ""),
+                            })
+                    
+                    # Handle tool_calls in assistant messages
+                    if tool_calls and msg["role"] == "assistant":
+                        openai_msg["tool_calls"] = tool_calls
+                        # Content can be empty or text for assistant with tool_calls
+                        if parts:
+                            if len(parts) == 1 and parts[0].get("type") == "text":
+                                openai_msg["content"] = parts[0]["text"]
+                            else:
+                                openai_msg["content"] = parts
+                        else:
+                            openai_msg["content"] = None
+                        openai_messages.append(openai_msg)
+                    # Handle tool_results - convert to separate tool messages
+                    elif tool_results:
+                        for result in tool_results:
+                            tool_msg = {
+                                "role": "tool",
+                                "tool_call_id": result["tool_use_id"],
+                                "content": result["content"] if isinstance(result["content"], str) else json.dumps(result["content"]),
+                            }
+                            openai_messages.append(tool_msg)
                     else:
-                        openai_msg["content"] = parts
+                        # Regular content
+                        if len(parts) == 1 and parts[0].get("type") == "text":
+                            openai_msg["content"] = parts[0]["text"]
+                        elif parts:
+                            openai_msg["content"] = parts
+                        else:
+                            openai_msg["content"] = ""
+                        openai_messages.append(openai_msg)
+                else:
+                    openai_msg["content"] = ""
+                    openai_messages.append(openai_msg)
 
-                openai_messages.append(openai_msg)
             openai_kwargs["messages"] = openai_messages
 
         # System prompt - in Bedrock it can be a separate field
@@ -383,6 +433,38 @@ class BatchInferenceClient:
         if "stop_sequences" in bedrock_request:
             openai_kwargs["stop"] = bedrock_request["stop_sequences"]
 
+        # Tools - convert Bedrock tool format to OpenAI format
+        if "tools" in bedrock_request:
+            openai_tools = []
+            for tool in bedrock_request["tools"]:
+                openai_tool = {
+                    "type": "function",
+                    "function": {
+                        "name": tool.get("name", ""),
+                        "description": tool.get("description", ""),
+                        "parameters": tool.get("input_schema", {}),
+                    }
+                }
+                openai_tools.append(openai_tool)
+            openai_kwargs["tools"] = openai_tools
+
+        # Tool choice - convert Bedrock tool_choice to OpenAI format
+        if "tool_choice" in bedrock_request:
+            bedrock_choice = bedrock_request["tool_choice"]
+            if isinstance(bedrock_choice, dict):
+                choice_type = bedrock_choice.get("type", "auto")
+                if choice_type == "auto":
+                    openai_kwargs["tool_choice"] = "auto"
+                elif choice_type == "any":
+                    openai_kwargs["tool_choice"] = "required"
+                elif choice_type == "tool":
+                    openai_kwargs["tool_choice"] = {
+                        "type": "function",
+                        "function": {"name": bedrock_choice.get("name", "")}
+                    }
+            else:
+                openai_kwargs["tool_choice"] = bedrock_choice
+
         # Top K - not directly supported in OpenAI, skip
         # anthropic_version - skip
 
@@ -401,12 +483,29 @@ class BatchInferenceClient:
         message = choice.message
 
         # Build content blocks
-        content = []
+        content: list[dict[str, Any]] = []
+        
+        # Add text content if present
         if message.content:
             content.append({
                 "type": "text",
                 "text": message.content,
             })
+
+        # Handle tool calls - convert OpenAI tool_calls to Bedrock tool_use blocks
+        if hasattr(message, "tool_calls") and message.tool_calls:
+            for tool_call in message.tool_calls:
+                tool_use_block: dict[str, Any] = {
+                    "type": "tool_use",
+                    "id": tool_call.id,
+                    "name": tool_call.function.name,
+                }
+                # Parse arguments from JSON string
+                try:
+                    tool_use_block["input"] = json.loads(tool_call.function.arguments)
+                except (json.JSONDecodeError, TypeError):
+                    tool_use_block["input"] = {"raw": tool_call.function.arguments}
+                content.append(tool_use_block)
 
         # Build Bedrock-style response
         bedrock_response: dict[str, Any] = {
