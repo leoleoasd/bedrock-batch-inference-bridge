@@ -82,3 +82,6 @@ class BatchConfig:
     job_name_prefix: str = "batch-inference"
     bedrock_min_records: int = 100  # Bedrock's hard minimum, pad with dummy if needed
     debug_mode: bool = False  # If True, use direct invoke_model instead of batch
+    litellm_mode: bool = False  # If True, use litellm acompletion instead of batch
+    litellm_model: str = ""  # Model name for litellm (e.g., "gpt-4", "claude-3-opus")
+    litellm_api_base: str = ""  # API base URL for litellm (e.g., "https://hosted-vllm-api.co")

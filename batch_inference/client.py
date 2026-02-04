@@ -1,5 +1,6 @@
 """Main client for batch inference SDK."""
 
+import json
 import logging
 from typing import Any
 
@@ -60,17 +61,20 @@ class BatchInferenceClient:
         job_timeout_hours: int = 24,
         job_name_prefix: str = "batch-inference",
         debug_mode: bool = False,
+        litellm_mode: bool = False,
+        litellm_model: str = "",
+        litellm_api_base: str = "",
     ) -> None:
         """Configure and start the batch inference client.
 
         Args:
             model_id: Bedrock model ID to use for all requests.
             s3_input_uri: S3 URI for batch input files (e.g., s3://bucket/input/).
-                Not required in debug_mode.
+                Not required in debug_mode or litellm_mode.
             s3_output_uri: S3 URI for batch output files (e.g., s3://bucket/output/).
-                Not required in debug_mode.
+                Not required in debug_mode or litellm_mode.
             role_arn: IAM role ARN with permissions for batch inference.
-                Not required in debug_mode.
+                Not required in debug_mode or litellm_mode.
             region: AWS region (default "us-west-2").
             min_batch_size: Minimum requests before time-based submission (default 100).
             max_batch_size: Submit immediately when this many requests queued (default 1000).
@@ -80,6 +84,12 @@ class BatchInferenceClient:
             job_name_prefix: Prefix for batch job names (default "batch-inference").
             debug_mode: If True, use direct invoke_model calls instead of batch
                 inference. Useful for testing without S3/batch job setup.
+            litellm_mode: If True, use litellm acompletion instead of batch inference.
+                Transforms Bedrock request format to OpenAI format automatically.
+            litellm_model: Model name for litellm (e.g., "gpt-4o", "anthropic/claude-3-opus").
+                Required if litellm_mode is True.
+            litellm_api_base: API base URL for litellm (e.g., "https://hosted-vllm-api.co").
+                Optional, used for custom endpoints like vLLM or other OpenAI-compatible APIs.
         """
         if self._is_setup:
             raise AlreadySetupError()
@@ -97,7 +107,21 @@ class BatchInferenceClient:
             job_timeout_hours=job_timeout_hours,
             job_name_prefix=job_name_prefix,
             debug_mode=debug_mode,
+            litellm_mode=litellm_mode,
+            litellm_model=litellm_model,
+            litellm_api_base=litellm_api_base,
         )
+
+        # In litellm mode, skip batch infrastructure setup
+        if litellm_mode:
+            if not litellm_model:
+                raise ValueError("litellm_model is required when litellm_mode is True")
+            logger.info(
+                f"BatchInferenceClient setup in LITELLM MODE: model={litellm_model}, "
+                "using litellm acompletion calls"
+            )
+            self._is_setup = True
+            return
 
         # In debug mode, skip batch infrastructure setup
         if debug_mode:
@@ -171,6 +195,10 @@ class BatchInferenceClient:
         if isinstance(body, str):
             body = body.encode("utf-8")
 
+        # Litellm mode: use litellm acompletion
+        if self._config.litellm_mode:
+            return await self._invoke_model_litellm(body)
+
         # Debug mode: call bedrock-runtime invoke_model directly
         if self._config.debug_mode:
             return await self._invoke_model_direct(body, contentType, accept)
@@ -223,6 +251,192 @@ class BatchInferenceClient:
                 "body": StreamingBody(response_body),
                 "contentType": response.get("contentType", "application/json"),
             }
+
+    async def _invoke_model_litellm(
+        self,
+        body: bytes,
+    ) -> dict[str, Any]:
+        """Invoke model using litellm acompletion (litellm mode).
+
+        Transforms Bedrock Claude request format to OpenAI format,
+        calls litellm, and transforms the response back.
+
+        Args:
+            body: Request payload in Bedrock format (bytes).
+
+        Returns:
+            Response dict matching boto3 invoke_model response.
+        """
+        assert self._config is not None
+
+        try:
+            import litellm
+        except ImportError:
+            raise ImportError(
+                "litellm is required for litellm_mode. "
+                "Install it with: pip install litellm"
+            )
+
+        # Parse Bedrock request
+        bedrock_request = json.loads(body.decode("utf-8"))
+
+        # Transform Bedrock format to OpenAI format
+        openai_kwargs = self._bedrock_to_openai(bedrock_request)
+
+        # Add api_base if configured
+        if self._config.litellm_api_base:
+            openai_kwargs["api_base"] = self._config.litellm_api_base
+
+        # Call litellm
+        response = await litellm.acompletion(
+            model=self._config.litellm_model,
+            **openai_kwargs,
+        )
+
+        # Transform response back to Bedrock format
+        bedrock_response = self._openai_to_bedrock(response)
+
+        # Wrap in StreamingBody for compatibility
+        response_bytes = json.dumps(bedrock_response).encode("utf-8")
+        return {
+            "body": StreamingBody(response_bytes),
+            "contentType": "application/json",
+        }
+
+    def _bedrock_to_openai(self, bedrock_request: dict[str, Any]) -> dict[str, Any]:
+        """Transform Bedrock Claude request format to OpenAI format.
+
+        Args:
+            bedrock_request: Request in Bedrock Claude format.
+
+        Returns:
+            Request kwargs for OpenAI/litellm format.
+        """
+        openai_kwargs: dict[str, Any] = {}
+
+        # Messages - format is similar but need to handle content blocks
+        if "messages" in bedrock_request:
+            openai_messages = []
+            for msg in bedrock_request["messages"]:
+                openai_msg: dict[str, Any] = {"role": msg["role"]}
+
+                # Handle content - can be string or list of content blocks
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    openai_msg["content"] = content
+                elif isinstance(content, list):
+                    # Convert content blocks to OpenAI format
+                    parts = []
+                    for block in content:
+                        if block.get("type") == "text":
+                            parts.append({"type": "text", "text": block.get("text", "")})
+                        elif block.get("type") == "image":
+                            # Handle image blocks
+                            source = block.get("source", {})
+                            if source.get("type") == "base64":
+                                parts.append({
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:{source.get('media_type', 'image/png')};base64,{source.get('data', '')}"
+                                    }
+                                })
+                    # If only text parts, simplify to string
+                    if len(parts) == 1 and parts[0].get("type") == "text":
+                        openai_msg["content"] = parts[0]["text"]
+                    else:
+                        openai_msg["content"] = parts
+
+                openai_messages.append(openai_msg)
+            openai_kwargs["messages"] = openai_messages
+
+        # System prompt - in Bedrock it can be a separate field
+        if "system" in bedrock_request:
+            system_content = bedrock_request["system"]
+            if isinstance(system_content, str):
+                openai_kwargs["messages"] = [
+                    {"role": "system", "content": system_content}
+                ] + openai_kwargs.get("messages", [])
+            elif isinstance(system_content, list):
+                # Handle list of system content blocks
+                text_parts = [
+                    block.get("text", "")
+                    for block in system_content
+                    if block.get("type") == "text"
+                ]
+                openai_kwargs["messages"] = [
+                    {"role": "system", "content": "\n".join(text_parts)}
+                ] + openai_kwargs.get("messages", [])
+
+        # Max tokens
+        if "max_tokens" in bedrock_request:
+            openai_kwargs["max_tokens"] = bedrock_request["max_tokens"]
+
+        # Temperature
+        if "temperature" in bedrock_request:
+            openai_kwargs["temperature"] = bedrock_request["temperature"]
+
+        # Top P
+        if "top_p" in bedrock_request:
+            openai_kwargs["top_p"] = bedrock_request["top_p"]
+
+        # Stop sequences
+        if "stop_sequences" in bedrock_request:
+            openai_kwargs["stop"] = bedrock_request["stop_sequences"]
+
+        # Top K - not directly supported in OpenAI, skip
+        # anthropic_version - skip
+
+        return openai_kwargs
+
+    def _openai_to_bedrock(self, response: Any) -> dict[str, Any]:
+        """Transform OpenAI/litellm response to Bedrock Claude format.
+
+        Args:
+            response: Response from litellm acompletion.
+
+        Returns:
+            Response in Bedrock Claude format.
+        """
+        choice = response.choices[0]
+        message = choice.message
+
+        # Build content blocks
+        content = []
+        if message.content:
+            content.append({
+                "type": "text",
+                "text": message.content,
+            })
+
+        # Build Bedrock-style response
+        bedrock_response: dict[str, Any] = {
+            "id": response.id,
+            "type": "message",
+            "role": "assistant",
+            "content": content,
+            "model": response.model,
+            "stop_reason": self._openai_finish_reason_to_bedrock(choice.finish_reason),
+        }
+
+        # Add usage if available
+        if response.usage:
+            bedrock_response["usage"] = {
+                "input_tokens": response.usage.prompt_tokens,
+                "output_tokens": response.usage.completion_tokens,
+            }
+
+        return bedrock_response
+
+    def _openai_finish_reason_to_bedrock(self, finish_reason: str | None) -> str:
+        """Convert OpenAI finish_reason to Bedrock stop_reason."""
+        mapping = {
+            "stop": "end_turn",
+            "length": "max_tokens",
+            "content_filter": "content_filtered",
+            "tool_calls": "tool_use",
+            "function_call": "tool_use",
+        }
+        return mapping.get(finish_reason or "", "end_turn")
 
     async def close(self) -> None:
         """Flush pending requests and stop the client."""

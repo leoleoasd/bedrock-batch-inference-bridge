@@ -14,3 +14,6 @@ dev = [
     "python-dotenv>=1.0.0",
     "tqdm>=4.67.1",
 ]
+litellm = [
+    "litellm>=1.0.0",
+]

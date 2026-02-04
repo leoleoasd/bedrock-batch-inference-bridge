@@ -8,6 +8,8 @@ A Python SDK that provides a boto3-compatible `invoke_model` API while transpare
 - **Automatic batching**: Requests are batched based on configurable size and timeout thresholds
 - **Parallel job execution**: Multiple batch jobs can run concurrently
 - **Async-first design**: Built on asyncio for high concurrency
+- **Debug mode**: Direct `invoke_model` calls for testing without S3/batch setup
+- **LiteLLM mode**: Use any LLM provider via litellm with automatic format conversion
 
 ## Installation
 
@@ -21,7 +23,15 @@ Or with uv:
 uv add git+ssh://git@github.com/leoleoasd/bedrock-batch-inference-bridge.git
 ```
 
+For LiteLLM support:
+
+```bash
+pip install "batch-inference[litellm] @ git+ssh://git@github.com/leoleoasd/bedrock-batch-inference-bridge.git"
+```
+
 ## Quick Start
+
+### Batch Mode (Default)
 
 ```python
 import asyncio
@@ -59,6 +69,59 @@ async def main():
 
 asyncio.run(main())
 ```
+
+### Debug Mode
+
+For testing without S3/batch job setup, use debug mode to call `bedrock-runtime.invoke_model` directly:
+
+```python
+await client.setup(
+    model_id="anthropic.claude-3-haiku-20240307-v1:0",
+    region="us-west-2",
+    debug_mode=True,
+)
+```
+
+### LiteLLM Mode
+
+Use any LLM provider (OpenAI, Anthropic, local vLLM, etc.) with automatic Bedrock-to-OpenAI format conversion:
+
+```python
+# Using OpenAI
+await client.setup(
+    model_id="not-used",
+    litellm_mode=True,
+    litellm_model="gpt-4o",
+)
+
+# Using Anthropic directly
+await client.setup(
+    model_id="not-used",
+    litellm_mode=True,
+    litellm_model="anthropic/claude-3-opus-20240229",
+)
+
+# Using Bedrock via LiteLLM
+await client.setup(
+    model_id="not-used",
+    litellm_mode=True,
+    litellm_model="bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+)
+
+# Using local vLLM or OpenAI-compatible endpoint
+await client.setup(
+    model_id="not-used",
+    litellm_mode=True,
+    litellm_model="hosted_vllm/Qwen/Qwen3-32B",
+    litellm_api_base="http://127.0.0.1:30000/v1",
+)
+```
+
+The LiteLLM mode automatically transforms:
+- Bedrock Claude request format → OpenAI format
+- OpenAI response format → Bedrock Claude format
+
+This allows you to use the same request body format regardless of the backend.
 
 ## Concurrent Requests
 
@@ -113,9 +176,9 @@ asyncio.run(main())
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `model_id` | str | required | Bedrock model ID or inference profile ARN |
-| `s3_input_uri` | str | required | S3 URI for batch input files (e.g., `s3://bucket/input/`) |
-| `s3_output_uri` | str | required | S3 URI for batch output files (e.g., `s3://bucket/output/`) |
-| `role_arn` | str | required | IAM role ARN with Bedrock and S3 permissions |
+| `s3_input_uri` | str | `""` | S3 URI for batch input files (required for batch mode) |
+| `s3_output_uri` | str | `""` | S3 URI for batch output files (required for batch mode) |
+| `role_arn` | str | `""` | IAM role ARN with Bedrock and S3 permissions (required for batch mode) |
 | `region` | str | `us-west-2` | AWS region |
 | `min_batch_size` | int | `100` | Minimum requests before time-based submission |
 | `max_batch_size` | int | `1000` | Submit immediately when this many requests queued |
@@ -123,6 +186,10 @@ asyncio.run(main())
 | `poll_interval` | float | `5.0` | Seconds between job status polls |
 | `job_timeout_hours` | int | `24` | Maximum hours for batch job |
 | `job_name_prefix` | str | `batch-inference` | Prefix for batch job names |
+| `debug_mode` | bool | `False` | Use direct invoke_model calls instead of batch |
+| `litellm_mode` | bool | `False` | Use litellm acompletion instead of batch |
+| `litellm_model` | str | `""` | Model name for litellm (required if litellm_mode is True) |
+| `litellm_api_base` | str | `""` | API base URL for litellm (for custom endpoints) |
 
 ### Batching Behavior
 
@@ -200,8 +267,17 @@ cp .env.example .env
 # Install dev dependencies
 uv sync --extra dev
 
-# Run integration test
+# Run integration test (batch mode)
 uv run python test_integration.py
+
+# Run in debug mode (direct invoke_model)
+uv run python test_integration.py --debug
+
+# Run in litellm mode
+uv run python test_integration.py --litellm --litellm-model "bedrock/anthropic.claude-3-haiku-20240307-v1:0"
+
+# Run with custom endpoint (vLLM, etc.)
+uv run python test_integration.py --litellm --litellm-model "hosted_vllm/Qwen/Qwen3-32B" --litellm-api-base "http://127.0.0.1:30000/v1"
 ```
 
 ## License
